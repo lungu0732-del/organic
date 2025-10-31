@@ -1,0 +1,243 @@
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install fastapi uvicorn rdkit-pypi pydantic
+uvicorn app:app --reload
+from typing import List, Dict, Any
+from fastapi import FastAPI
+from pydantic import BaseModel
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+app = FastAPI(title="Chem Routes")
+
+# Minimal template catalog (expand with more SMARTS)
+TEMPLATES = [
+    {
+        "id": "sn2_primary_halide",
+        "name": "SN2 on primary alkyl halide",
+        "forward_smarts": "[C:1][Cl,Br,I:2].[N:3]>>[C:1][N:3].[Cl,Br,I:2]",
+        "retro_smarts": "[C:1][N:3]>>[C:1][Cl:2].[N:3]",
+        "conditions": {"solvent": "DMF/DMSO", "temp": "0–25°C", "notes": "Primary > secondary; no tertiary"},
+        "constraints": {"forbid_tertiary": True},
+        "base_score": 0.7,
+    },
+    {
+        "id": "fischer_esterification",
+        "name": "Fischer esterification",
+        "forward_smarts": "[C:1](=O)[O:2].[O:3][C:4]>>[C:1](=O)[O:3][C:4].[O:2]",
+        "retro_smarts": "[C:1](=O)[O:3][C:4]>>[C:1](=O)[O:2].[O:3][C:4]",
+        "conditions": {"acid": "H2SO4", "solvent": "ROH", "notes": "Removes water to drive equilibrium"},
+        "base_score": 0.6,
+    },
+]
+
+class PredictRequest(BaseModel):
+    reactants: List[str]
+    conditions: Dict[str, Any] = {}
+
+class Candidate(BaseModel):
+    product: str
+    template_id: str
+    score: float
+    conditions: Dict[str, Any]
+    notes: str = ""
+
+class PredictResponse(BaseModel):
+    candidates: List[Candidate]
+
+def apply_forward(template, reactant_smiles: List[str]) -> List[str]:
+    rxn = AllChem.ReactionFromSmarts(template["forward_smarts"])
+    mols = [Chem.MolFromSmiles(s) for s in reactant_smiles]
+    if any(m is None for m in mols):
+        return []
+    outcomes = rxn.RunReactants(tuple(mols))
+    products = []
+    for prod_tuple in outcomes:
+        for p in prod_tuple:
+            smi = Chem.MolToSmiles(p, canonical=True)
+            products.append(smi)
+    return list(set(products))
+
+def heuristic_score(template, reactant_smiles: List[str], product_smi: str) -> float:
+    score = template.get("base_score", 0.5)
+    # simple steric penalty: tertiary carbon near leaving group (toy example)
+    if template.get("constraints", {}).get("forbid_tertiary"):
+        for s in reactant_smiles:
+            m = Chem.MolFromSmiles(s)
+            if m:
+                for atom in m.GetAtoms():
+                    if atom.GetDegree() == 4:  # rough proxy
+                        score -= 0.2
+                        break
+    # normalize to [0,1]
+    return max(0.0, min(1.0, score))
+
+@app.post("/predict", response_model=PredictResponse)
+def predict(req: PredictRequest):
+    candidates = []
+    for tpl in TEMPLATES:
+        prods = apply_forward(tpl, req.reactants)
+        for p in prods:
+            sc = heuristic_score(tpl, req.reactants, p)
+            candidates.append(Candidate(
+                product=p, template_id=tpl["id"], score=sc,
+                conditions=tpl.get("conditions", {}),
+                notes=tpl.get("name", "")
+            ))
+    # sort and top-k
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    return PredictResponse(candidates=candidates[:10])
+from collections import deque
+
+class RetroRequest(BaseModel):
+    target: str
+    max_depth: int = 3
+
+class Step(BaseModel):
+    template_id: str
+    product: str
+    precursors: List[str]
+    notes: str = ""
+
+class Route(BaseModel):
+    steps: List[Step]
+    cost: float
+
+class RetroResponse(BaseModel):
+    routes: List[Route]
+
+def apply_retro(template, product_smi: str) -> List[List[str]]:
+    rxn = AllChem.ReactionFromSmarts(template["retro_smarts"])
+    m = Chem.MolFromSmiles(product_smi)
+    if m is None:
+        return []
+    outcomes = rxn.RunReactants((m,))
+    precursor_sets = []
+    for prec_tuple in outcomes:
+        precursor_sets.append([Chem.MolToSmiles(p, canonical=True) for p in prec_tuple])
+    return precursor_sets
+
+def route_cost(steps: List[Step]) -> float:
+    base = sum(0.5 for _ in steps)  # step count penalty
+    return base  # extend with availability, protecting group penalties, etc.
+
+@app.post("/retrosynthesize", response_model=RetroResponse)
+def retrosynthesize(req: RetroRequest):
+    start = req.target
+    queue = deque([([], start, 0)])  # (steps_so_far, current_target, depth)
+    routes = []
+
+    while queue:
+        steps_so_far, current, depth = queue.popleft()
+        if depth >= req.max_depth:
+            continue
+        for tpl in TEMPLATES:
+            prec_sets = apply_retro(tpl, current)
+            for precs in prec_sets:
+                new_step = Step(template_id=tpl["id"], product=current, precursors=precs, notes=tpl["name"])
+                new_steps = steps_so_far + [new_step]
+                cost = route_cost(new_steps)
+                # stop if all precursors are simple (heuristic: <= 8 heavy atoms)
+                simple = True
+                for s in precs:
+                    m = Chem.MolFromSmiles(s)
+                    if m is None or Chem.Descriptors.HeavyAtomCount(m) > 8:
+                        simple = False
+                        break
+                if simple:
+                    routes.append(Route(steps=new_steps, cost=cost))
+                else:
+                    for p in precs:
+                        queue.append((new_steps, p, depth + 1))
+
+    routes.sort(key=lambda r: r.cost)
+    return RetroResponse(routes=routes[:5])
+npm create vite@latest chem-routes -- --template react
+cd chem-routes
+npm install
+npm run dev
+import { useState } from "react";
+
+export default function App() {
+  const [reactants, setReactants] = useState(["CCCl", "N"]);
+  const [target, setTarget] = useState("CCN");
+  const [pred, setPred] = useState([]);
+  const [routes, setRoutes] = useState([]);
+
+  const predict = async () => {
+    const res = await fetch("http://localhost:8000/predict", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reactants }),
+    });
+    const data = await res.json();
+    setPred(data.candidates || []);
+  };
+
+  const retro = async () => {
+    const res = await fetch("http://localhost:8000/retrosynthesize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target, max_depth: 3 }),
+    });
+    const data = await res.json();
+    setRoutes(data.routes || []);
+  };
+
+  return (
+    <main style={{ maxWidth: 960, margin: "2rem auto", padding: 16 }}>
+      <h1>Chem Routes MVP</h1>
+
+      <section>
+        <h2>Forward prediction</h2>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            value={reactants[0]}
+            onChange={(e) => setReactants([e.target.value, reactants[1]])}
+            placeholder="Reactant 1 (SMILES)"
+          />
+          <input
+            value={reactants[1]}
+            onChange={(e) => setReactants([reactants[0], e.target.value])}
+            placeholder="Reactant 2 (SMILES)"
+          />
+          <button onClick={predict}>Predict</button>
+        </div>
+        <ul>
+          {pred.map((c, i) => (
+            <li key={i}>
+              <strong>{c.product}</strong> — {c.notes} — score {c.score.toFixed(2)}
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section>
+        <h2>Retrosynthesis</h2>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            value={target}
+            onChange={(e) => setTarget(e.target.value)}
+            placeholder="Target (SMILES)"
+          />
+          <button onClick={retro}>Retrosynthesize</button>
+        </div>
+        <ol>
+          {routes.map((r, i) => (
+            <li key={i}>
+              Route cost {r.cost.toFixed(2)}
+              <ul>
+                {r.steps.map((s, j) => (
+                  <li key={j}>
+                    {s.template_id}: {s.product} ← {s.precursors.join(" + ")}
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ol>
+      </section>
+    </main>
+  );
+}
+
